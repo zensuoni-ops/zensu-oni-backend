@@ -1,6 +1,7 @@
 {
   "name": "zensu-oni-backend",
   "version": "1.0.0",
+  "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -9,7 +10,6 @@
     "express": "^4.18.2",
     "webtorrent": "^2.1.34",
     "cors": "^2.8.5",
-    "node-fetch": "^2.7.0",
     "xml2js": "^0.6.2"
   }
 }
