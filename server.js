@@ -1,8 +1,7 @@
-const express = require('express');
-const cors = require('cors');
-const fetch = require('node-fetch');
-const xml2js = require('xml2js');
-const WebTorrent = require('webtorrent');
+import express from 'express';
+import cors from 'cors';
+import { parseStringPromise } from 'xml2js';
+import WebTorrent from 'webtorrent';
 
 const app = express();
 const client = new WebTorrent();
@@ -10,7 +9,6 @@ const client = new WebTorrent();
 app.use(cors());
 app.use(express.json());
 
-// Search Nyaa.si for anime episode
 app.get('/search', async (req, res) => {
   const { anime, episode } = req.query;
   if (!anime || !episode) {
@@ -18,22 +16,17 @@ app.get('/search', async (req, res) => {
   }
   try {
     const epNum = String(episode).padStart(2, '0');
-    
-    // Try SubsPlease first (best quality)
     const queries = [
       `SubsPlease ${anime} ${epNum}`,
       `${anime} ${epNum} 1080p`,
       `${anime} ${epNum}`
     ];
-    
     for (const query of queries) {
       const nyaaUrl = `https://nyaa.si/?page=rss&q=${encodeURIComponent(query)}&c=1_2&f=0`;
       const response = await fetch(nyaaUrl);
       const xml = await response.text();
-      const parser = new xml2js.Parser();
-      const result = await parser.parseStringPromise(xml);
+      const result = await parseStringPromise(xml);
       const items = result?.rss?.channel?.[0]?.item;
-      
       if (items && items.length > 0) {
         const best = items[0];
         const magnet = best['nyaa:magnetLink']?.[0] || best.link?.[0];
@@ -44,13 +37,12 @@ app.get('/search', async (req, res) => {
         });
       }
     }
-    res.status(404).json({ error: 'Episode not found on Nyaa' });
+    res.status(404).json({ error: 'Episode not found' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Stream the torrent
 app.get('/stream', (req, res) => {
   const { magnet } = req.query;
   if (!magnet) return res.status(400).json({ error: 'Missing magnet' });
@@ -82,7 +74,10 @@ function streamFile(file, req, res) {
     });
     file.createReadStream({ start, end: chunkEnd }).pipe(res);
   } else {
-    res.writeHead(200, { 'Content-Length': fileSize, 'Content-Type': 'video/mp4' });
+    res.writeHead(200, { 
+      'Content-Length': fileSize, 
+      'Content-Type': 'video/mp4' 
+    });
     file.createReadStream().pipe(res);
   }
 }
