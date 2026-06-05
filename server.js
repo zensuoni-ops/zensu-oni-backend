@@ -2,6 +2,13 @@ import express from 'express';
 import cors from 'cors';
 import { parseStringPromise } from 'xml2js';
 import WebTorrent from 'webtorrent';
+import ffmpeg from 'fluent-ffmpeg';
+import { createRequire } from 'module';
+
+// Safe import for CommonJS package
+const require = createRequire(import.meta.url);
+const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
+ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
 const app = express();
 const client = new WebTorrent();
@@ -9,10 +16,10 @@ const client = new WebTorrent();
 app.use(cors());
 app.use(express.json());
 
-// ── Keep-alive for cron-job ──────────────────────────────
+// ── Keep-alive ────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
-// ── Helpers ──────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────
 
 function extractSeasonNumber(title) {
   const match = title.match(/(\d+)(?:st|nd|rd|th)\s+season/i)
@@ -54,26 +61,30 @@ async function resolveAnimeTitle(animeName) {
       original: animeName
     };
   } catch {
-    return { english: null, romaji: null, synonyms: [], original: animeName };
+    return { 
+      english: null, 
+      romaji: null, 
+      synonyms: [], 
+      original: animeName 
+    };
   }
 }
 
-// Memory cleanup - remove finished/stalled torrents
 function cleanupTorrents() {
   if (client.torrents.length > 10) {
     const oldest = client.torrents.slice(0, 5);
-    oldest.forEach(t => {
-      try { t.destroy(); } catch {}
-    });
+    oldest.forEach(t => { try { t.destroy(); } catch {} });
   }
 }
 
-// ── Search endpoint ───────────────────────────────────────
+// ── Search ────────────────────────────────────────────────
 app.get('/search', async (req, res) => {
   const { anime, episode, type } = req.query;
 
   if (!anime || !episode) {
-    return res.status(400).json({ error: 'Missing anime or episode parameter' });
+    return res.status(400).json({ 
+      error: 'Missing anime or episode parameter' 
+    });
   }
 
   try {
@@ -85,7 +96,6 @@ app.get('/search', async (req, res) => {
     const epPadded = String(epNum).padStart(2, '0');
 
     const titles = await resolveAnimeTitle(anime);
-
     const englishClean = titles.english ? cleanBaseTitle(titles.english) : null;
     const romajiClean = titles.romaji ? cleanBaseTitle(titles.romaji) : null;
     const originalClean = cleanBaseTitle(anime);
@@ -138,7 +148,6 @@ app.get('/search', async (req, res) => {
         if (items && items.length > 0) {
           const qualities = {};
 
-          // Sort by seeder count - highest seeders = fastest stream
           const sorted = items.sort((a, b) => {
             const seedsA = parseInt(a['nyaa:seeders']?.[0] || 0);
             const seedsB = parseInt(b['nyaa:seeders']?.[0] || 0);
@@ -173,7 +182,7 @@ app.get('/search', async (req, res) => {
             }
           }
 
-          // Fallback if no quality tags found
+          // Fallback if no quality labels found
           if (Object.keys(qualities).length === 0) {
             const best = sorted[0];
             const magnet = best['nyaa:magnetLink']?.[0] || best.link?.[0];
@@ -183,7 +192,6 @@ app.get('/search', async (req, res) => {
             };
           }
 
-          // Default stream = highest available quality
           const defaultStream = (
             qualities['1080p'] ||
             qualities['720p'] ||
@@ -215,30 +223,28 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// ── Stream endpoint ───────────────────────────────────────
+// ── Stream ────────────────────────────────────────────────
 app.get('/stream', (req, res) => {
   const { magnet } = req.query;
   if (!magnet) return res.status(400).json({ error: 'Missing magnet' });
 
   const decoded = decodeURIComponent(magnet);
-
-  // Clean up old torrents before adding new one
   cleanupTorrents();
 
-  // Check if already loaded
+  // Reuse existing torrent if already loaded
   const existing = client.torrents.find(t => t.magnetURI === decoded);
   if (existing) {
     const file = existing.files
       .sort((a, b) => b.length - a.length)
       .find(f => f.name.match(/\.(mkv|mp4|avi)$/i));
-    if (file) return streamFile(file, req, res);
+    if (file) return transcodeAndStream(file, req, res);
   }
 
-  // Timeout if no peers found in 60 seconds
+  // Timeout if no peers found within 60 seconds
   const timeout = setTimeout(() => {
     if (!res.headersSent) {
       res.status(504).json({ 
-        error: 'Stream timeout - no peers available. Try a different quality.' 
+        error: 'Stream timeout - no peers found. Try a different quality.' 
       });
     }
   }, 60000);
@@ -246,44 +252,57 @@ app.get('/stream', (req, res) => {
   client.add(decoded, (torrent) => {
     clearTimeout(timeout);
 
+    // Pick largest video file in the torrent
     const file = torrent.files
       .sort((a, b) => b.length - a.length)
       .find(f => f.name.match(/\.(mkv|mp4|avi)$/i));
 
     if (!file) {
-      return res.status(404).json({ error: 'No video file found in torrent' });
+      return res.status(404).json({ 
+        error: 'No video file found in torrent' 
+      });
     }
 
-    streamFile(file, req, res);
+    transcodeAndStream(file, req, res);
   });
 });
 
-function streamFile(file, req, res) {
-  const fileSize = file.length;
-  const range = req.headers.range;
+// ── Transcode MKV → MP4 on the fly ───────────────────────
+function transcodeAndStream(file, req, res) {
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Transfer-Encoding', 'chunked');
 
-  if (range) {
-    const parts = range.replace(/bytes=/, '').split('-');
-    const start = parseInt(parts[0]);
-    const end = parts[1] ? parseInt(parts[1]) : fileSize - 1;
-    const chunkSize = end - start + 1;
+  const isMkv = file.name.toLowerCase().endsWith('.mkv');
+  const stream = file.createReadStream();
+  const command = ffmpeg(stream);
 
-    res.writeHead(206, {
-      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-      'Accept-Ranges': 'bytes',
-      'Content-Length': chunkSize,
-      'Content-Type': 'video/mp4',
-    });
-    file.createReadStream({ start, end }).pipe(res);
-  } else {
-    res.writeHead(200, {
-      'Content-Length': fileSize,
-      'Content-Type': 'video/mp4',
-      'Accept-Ranges': 'bytes'
-    });
-    file.createReadStream().pipe(res);
+  if (isMkv) {
+    command.inputFormat('matroska');
   }
+
+  command
+    .outputOptions([
+      '-c:v copy',        // Copy video - no re-encoding (fast)
+      '-c:a aac',         // Convert audio to AAC (browser compatible)
+      '-f mp4',           // Output as MP4
+      '-movflags frag_keyframe+empty_moov+default_base_moof' // Streaming MP4
+    ])
+    .on('start', (cmd) => {
+      console.log('FFmpeg started:', cmd);
+    })
+    .on('error', (err) => {
+      console.error('FFmpeg error:', err.message);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Transcoding failed: ' + err.message });
+      }
+    })
+    .pipe(res, { end: true });
 }
 
+// ── Start server ──────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Zensu-Oni backend running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Zensu-Oni backend running on port ${PORT}`);
+  console.log(`FFmpeg path: ${ffmpegInstaller.path}`);
+});
