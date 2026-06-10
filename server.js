@@ -5,7 +5,6 @@ import WebTorrent from 'webtorrent';
 import ffmpeg from 'fluent-ffmpeg';
 import { createRequire } from 'module';
 
-// Safe import for CommonJS package
 const require = createRequire(import.meta.url);
 const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
@@ -61,20 +60,19 @@ async function resolveAnimeTitle(animeName) {
       original: animeName
     };
   } catch {
-    return { 
-      english: null, 
-      romaji: null, 
-      synonyms: [], 
-      original: animeName 
+    return {
+      english: null,
+      romaji: null,
+      synonyms: [],
+      original: animeName
     };
   }
 }
 
-function cleanupTorrents() {
-  if (client.torrents.length > 10) {
-    const oldest = client.torrents.slice(0, 5);
-    oldest.forEach(t => { try { t.destroy(); } catch {} });
-  }
+// Extract Nyaa torrent ID from URL
+function extractNyaaId(url) {
+  const match = url?.match(/nyaa\.si\/(?:view|download)\/(\d+)/);
+  return match ? match[1] : null;
 }
 
 // ── Search ────────────────────────────────────────────────
@@ -82,8 +80,8 @@ app.get('/search', async (req, res) => {
   const { anime, episode, type } = req.query;
 
   if (!anime || !episode) {
-    return res.status(400).json({ 
-      error: 'Missing anime or episode parameter' 
+    return res.status(400).json({
+      error: 'Missing anime or episode parameter'
     });
   }
 
@@ -157,54 +155,61 @@ app.get('/search', async (req, res) => {
           for (const item of sorted) {
             const title = item.title[0];
             const magnet = item['nyaa:magnetLink']?.[0] || item.link?.[0];
+            const link = item.link?.[0] || '';
             const seeders = parseInt(item['nyaa:seeders']?.[0] || 0);
+            const nyaaId = extractNyaaId(link);
+
+            const entry = {
+              magnet,
+              nyaaId,
+              torrentUrl: nyaaId
+                ? `https://nyaa.si/download/${nyaaId}.torrent`
+                : null,
+              streamUrl: `/stream?magnet=${encodeURIComponent(magnet)}`,
+              seeders
+            };
 
             if (title.includes('1080p') && !qualities['1080p']) {
-              qualities['1080p'] = {
-                streamUrl: `/stream?magnet=${encodeURIComponent(magnet)}`,
-                seeders
-              };
+              qualities['1080p'] = entry;
             } else if (title.includes('720p') && !qualities['720p']) {
-              qualities['720p'] = {
-                streamUrl: `/stream?magnet=${encodeURIComponent(magnet)}`,
-                seeders
-              };
+              qualities['720p'] = entry;
             } else if (title.includes('480p') && !qualities['480p']) {
-              qualities['480p'] = {
-                streamUrl: `/stream?magnet=${encodeURIComponent(magnet)}`,
-                seeders
-              };
+              qualities['480p'] = entry;
             } else if (title.includes('360p') && !qualities['360p']) {
-              qualities['360p'] = {
-                streamUrl: `/stream?magnet=${encodeURIComponent(magnet)}`,
-                seeders
-              };
+              qualities['360p'] = entry;
             }
           }
 
-          // Fallback if no quality labels found
           if (Object.keys(qualities).length === 0) {
             const best = sorted[0];
-            const magnet = best['nyaa:magnetLink']?.[0] || best.link?.[0];
-            qualities['1080p'] = {
-              streamUrl: `/stream?magnet=${encodeURIComponent(magnet)}`,
+            const mag = best['nyaa:magnetLink']?.[0] || best.link?.[0];
+            const lnk = best.link?.[0] || '';
+            const nId = extractNyaaId(lnk);
+            qualities['default'] = {
+              magnet: mag,
+              nyaaId: nId,
+              torrentUrl: nId
+                ? `https://nyaa.si/download/${nId}.torrent`
+                : null,
+              streamUrl: `/stream?magnet=${encodeURIComponent(mag)}`,
               seeders: parseInt(best['nyaa:seeders']?.[0] || 0)
             };
           }
 
-          const defaultStream = (
-            qualities['1080p'] ||
-            qualities['720p'] ||
+          const defaultQ =
             qualities['480p'] ||
-            qualities['360p']
-          ).streamUrl;
+            qualities['720p'] ||
+            qualities['1080p'] ||
+            Object.values(qualities)[0];
 
           return res.json({
             title: sorted[0].title[0],
             matchedQuery: query,
             resolvedTitle: englishClean || romajiClean || originalClean,
             qualities,
-            streamUrl: defaultStream
+            defaultMagnet: defaultQ.magnet,
+            defaultTorrentUrl: defaultQ.torrentUrl,
+            streamUrl: defaultQ.streamUrl
           });
         }
       } catch {
@@ -223,15 +228,54 @@ app.get('/search', async (req, res) => {
   }
 });
 
+// ── Torrent File Proxy ────────────────────────────────────
+// Proxies .torrent files from Nyaa.si to avoid CORS issues
+// Torrent files are tiny (1-50KB) - no storage concerns
+app.get('/torrent-proxy', async (req, res) => {
+  const { id } = req.query;
+  if (!id || !/^\d+$/.test(id)) {
+    return res.status(400).json({ error: 'Invalid torrent ID' });
+  }
+
+  try {
+    const torrentUrl = `https://nyaa.si/download/${id}.torrent`;
+    const response = await fetch(torrentUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; ZensuOni/1.0)'
+      }
+    });
+
+    if (!response.ok) {
+      return res.status(response.status).json({
+        error: `Nyaa returned ${response.status}`
+      });
+    }
+
+    const buffer = await response.arrayBuffer();
+
+    res.setHeader('Content-Type', 'application/x-bittorrent');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.send(Buffer.from(buffer));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ── Stream ────────────────────────────────────────────────
 app.get('/stream', (req, res) => {
   const { magnet } = req.query;
   if (!magnet) return res.status(400).json({ error: 'Missing magnet' });
 
   const decoded = decodeURIComponent(magnet);
-  cleanupTorrents();
 
-  // Reuse existing torrent if already loaded
+  // Destroy ALL other torrents first to prevent wrong episode bug
+  const toDestroy = client.torrents.filter(t => t.magnetURI !== decoded);
+  toDestroy.forEach(t => {
+    try { t.destroy(); } catch {}
+  });
+
+  // Reuse if already loaded
   const existing = client.torrents.find(t => t.magnetURI === decoded);
   if (existing) {
     const file = existing.files
@@ -240,11 +284,10 @@ app.get('/stream', (req, res) => {
     if (file) return transcodeAndStream(file, req, res);
   }
 
-  // Timeout if no peers found within 60 seconds
   const timeout = setTimeout(() => {
     if (!res.headersSent) {
-      res.status(504).json({ 
-        error: 'Stream timeout - no peers found. Try a different quality.' 
+      res.status(504).json({
+        error: 'Stream timeout - no peers found. Try a different quality.'
       });
     }
   }, 60000);
@@ -252,22 +295,23 @@ app.get('/stream', (req, res) => {
   client.add(decoded, (torrent) => {
     clearTimeout(timeout);
 
-    // Pick largest video file in the torrent
+    torrent.files.forEach(f => f.deselect());
+
     const file = torrent.files
       .sort((a, b) => b.length - a.length)
       .find(f => f.name.match(/\.(mkv|mp4|avi)$/i));
 
     if (!file) {
-      return res.status(404).json({ 
-        error: 'No video file found in torrent' 
+      return res.status(404).json({
+        error: 'No video file found in torrent'
       });
     }
 
+    file.select();
     transcodeAndStream(file, req, res);
   });
 });
 
-// ── Transcode MKV → MP4 on the fly ───────────────────────
 function transcodeAndStream(file, req, res) {
   res.setHeader('Content-Type', 'video/mp4');
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -283,10 +327,11 @@ function transcodeAndStream(file, req, res) {
 
   command
     .outputOptions([
-      '-c:v copy',        // Copy video - no re-encoding (fast)
-      '-c:a aac',         // Convert audio to AAC (browser compatible)
-      '-f mp4',           // Output as MP4
-      '-movflags frag_keyframe+empty_moov+default_base_moof' // Streaming MP4
+      '-c:v copy',
+      '-c:a aac',
+      '-c:s mov_text',
+      '-f mp4',
+      '-movflags frag_keyframe+empty_moov+default_base_moof'
     ])
     .on('start', (cmd) => {
       console.log('FFmpeg started:', cmd);
@@ -300,7 +345,7 @@ function transcodeAndStream(file, req, res) {
     .pipe(res, { end: true });
 }
 
-// ── Start server ──────────────────────────────────────────
+// ── Start ─────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Zensu-Oni backend running on port ${PORT}`);
